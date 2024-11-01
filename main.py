@@ -109,8 +109,9 @@ def main(rank, world_size):
 
     lossFunc = BCEWithLogitsLoss()
     scaler = torch.amp.grad_scaler.GradScaler()
-    opt = torch.optim.RMSprop(unet.parameters(),
-                              lr=0.001, weight_decay=1e-8, momentum=0.999, foreach=True)
+    opt = torch.optim.Adam(unet.parameters(), lr=0.0005)
+    # opt = torch.optim.RMSprop(unet.parameters(),
+    #                           lr=0.0003, weight_decay=1e-8, momentum=0.999, foreach=True)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'max', patience=5)  # goal: maximize Dice score
 
     for epoch in tqdm(range(NUM_EPOCHS)):
