@@ -19,6 +19,7 @@ from pathlib import Path
 import torch.amp
 from tqdm import tqdm
 
+from GeoDSWrapper import GeoDSWrapper
 from unet import unet as UNET
 
 import numpy as np
@@ -58,15 +59,15 @@ cdl = CDL("data", download=True, checksum=True, years=[2023, 2022])
 # landsat7 = Landsat7("data/shelby_landsat_2", bands=Landsat7.all_bands[:5])
 landsat8_test = Landsat8("data/IA/L2/1022", bands=BANDS)
 landsat_test = landsat8_test
-dataset_test =  landsat_test & cdl
+dataset_test =  GeoDSWrapper(landsat_test & cdl, nPerEpoch=1000)
 
-sampler_test = RandomGeoSampler(dataset_test, size=256, length=1000)
+# sampler_test = RandomGeoSampler(dataset_test, size=256, length=1000)
 
 landsat8_train = Landsat8("data/IA/L2/1023", bands=BANDS)
 landsat_train = landsat8_train
-dataset_train =  landsat_train & cdl
+dataset_train =  GeoDSWrapper(landsat_train & cdl, nPerEpoch=5000)
 
-sampler_train = RandomGeoSampler(dataset_train, size=256, length=5000)
+# sampler_train = RandomGeoSampler(dataset_train, size=256, length=5000)
 
 CORN = 1
 
@@ -192,8 +193,8 @@ def ddp_setup(rank, world_size):
 
 def main(rank, world_size):
     ddp_setup(rank, world_size)
-    dataloader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, sampler=sampler_test, collate_fn=stack_samples, pin_memory=True, num_workers=0)
-    dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler=sampler_train, collate_fn=stack_samples, pin_memory=True, num_workers=0)
+    dataloader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, sampler=dataset_test.sampler, collate_fn=stack_samples, pin_memory=True, num_workers=0)
+    dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler=dataset_train.sampler, collate_fn=stack_samples, pin_memory=True, num_workers=0)
     DEVICE = rank
     unet = UNET.UNet(len(BANDS), n_classes=1).to(DEVICE)
     unet = DDP(unet, device_ids=[DEVICE])
@@ -201,10 +202,10 @@ def main(rank, world_size):
     # lossFunc = tversky_loss#BCEWithLogitsLoss()
     lossFunc = BCEWithLogitsLoss()
     scaler = torch.amp.grad_scaler.GradScaler()
-    opt = torch.optim.Adam(unet.parameters(), lr=0.0001, foreach=True)
+    opt = torch.optim.Adam(unet.parameters(), lr=0.001, foreach=True, weight_decay=1e-8)
     # opt = torch.optim.RMSprop(unet.parameters(),
     #                           lr=0.0003, weight_decay=1e-8, momentum=0.999, foreach=True)
-    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'max', patience=5)  # goal: maximize Dice score
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'max', patience=5)  # goal: maximize Dice score
 
     for epoch in tqdm(range(NUM_EPOCHS)):
         totalTrainLoss = 0
@@ -227,7 +228,7 @@ def main(rank, world_size):
 
             pred = unet(image)
             loss = dice_loss(F.sigmoid(pred.squeeze(1)), mask.squeeze(1).float(), multiclass=False)
-            loss += lossFunc(pred, mask)
+            # loss = lossFunc(pred, mask)
 
             loss.backward()
             opt.step()
@@ -277,7 +278,7 @@ def main(rank, world_size):
 
             avgTrainLoss = totalTrainLoss / totalTrainSteps
             avgTestLoss = totalTestLoss / totalTestSteps
-            # scheduler.step(avgTestLoss)
+            scheduler.step(avgTestLoss)
 
             # print the model training and validation information
             print("[INFO] EPOCH: {}/{}".format(epoch + 1, NUM_EPOCHS))
