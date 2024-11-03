@@ -1,3 +1,4 @@
+from math import inf
 import time
 # import datetime
 import matplotlib.pyplot as plt
@@ -13,7 +14,8 @@ import torch.nn.functional as F
 # import torchgeo
 import logging
 from torchgeo.datasets import CDL, BoundingBox, landsat, stack_samples, Landsat7, Landsat8
-from torchgeo.samplers import RandomGeoSampler
+from torchgeo.datasets.geo import pyproj
+from torchgeo.samplers import RandomGeoSampler, Units
 from matplotlib import pyplot as plt
 from pathlib import Path
 
@@ -62,13 +64,27 @@ landsat8_test = Landsat8("data/IA/L2/1022", bands=BANDS)
 landsat_test = landsat8_test
 dataset_test =  landsat_test & cdl
 
-sampler_test = RandomGeoSampler(dataset_test, size=256, length=1000)
+ROI = [41.0628, 43.125, -95.4053, -91.6150, 1665460800, 1667102399]
+transformer = pyproj.Transformer.from_crs("EPSG:4326", str(landsat8_test.crs))
+BOUND_A = (41.5661, -94.7021)
+BOUND_B = (42.3748, -93.9111)
+BOUND_A_TRANS = transformer.transform(*BOUND_A)
+BOUND_B_TRANS = transformer.transform(*BOUND_B)
+
+ROI = BoundingBox(BOUND_A_TRANS[0], BOUND_B_TRANS[0], BOUND_A_TRANS[1], BOUND_B_TRANS[1], ROI[4], ROI[5])
+print("ROI:", ROI)
+
+sampler_test = RandomGeoSampler(dataset_test, size=256, length=1000)#, roi=ROI)
+
+print("roi: ", sampler_test.roi)
+print("crs: ", landsat8_test.crs)
+print("crs: ", type(landsat8_test.crs))
 
 landsat8_train = Landsat8("data/IA/L2/1023", bands=BANDS)
 landsat_train = landsat8_train
 dataset_train =  landsat_train & cdl
 
-sampler_train = RandomGeoSampler(dataset_train, size=256, length=10000)
+sampler_train = RandomGeoSampler(dataset_train, size=256, length=10000)#, #roi=ROI)
 
 CORN = 1
 
@@ -105,7 +121,7 @@ def dice_loss(input: Tensor, target: Tensor, multiclass: bool = False):
 def main(rank, world_size):
     # ddp_setup(rank, world_size)
     dataloader_test = DataLoader(dataset_test, batch_size=1, sampler=sampler_test, collate_fn=stack_samples, pin_memory=True, num_workers=0)
-    DEVICE = rank
+    DEVICE = "cuda:0"
     unet = UNET.UNet(len(BANDS), n_classes=1).to(DEVICE)
     state_dict = torch.load(sys.argv[1])
     unet.load_state_dict(state_dict, strict=False)
@@ -127,7 +143,7 @@ def main(rank, world_size):
             mask = torch.where(data["mask"] <= 60, data["mask"], 0.0)
             mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
             pred = unet(image.unsqueeze(0))
-            pred = ((pred.cpu()) > 0.5).float()
+            pred = ((F.sigmoid(pred.cpu())) > 0.5).float()
 
             figPred, ax = plt.subplots(1, 1, figsize=(4,4))
             ax.imshow(pred.squeeze())
@@ -247,4 +263,4 @@ def main(rank, world_size):
 #     world_size = torch.cuda.device_count()
 #     mp.spawn(main, args=(world_size,), nprocs=world_size)
 
-main(0, 1)
+main(1, 2)

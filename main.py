@@ -5,7 +5,7 @@ from torch.nn import BCEWithLogitsLoss
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 
-from torch import Tensor
+from torch import Tensor, distributed
 
 import torch.nn.functional as F
 # from torch.utils.tensorboard import SummaryWriter
@@ -42,7 +42,7 @@ import os
 #     torch.cuda.set_device(rank)
 #     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-BATCH_SIZE = 32
+BATCH_SIZE = 48
 NUM_EPOCHS = 100
 
 BANDS = [f"SR_B{i}" for i in range(2, 8)]
@@ -66,13 +66,21 @@ landsat8_train = Landsat8("data/IA/L2/1023", bands=BANDS)
 landsat_train = landsat8_train
 dataset_train =  landsat_train & cdl
 
-sampler_train = RandomGeoSampler(dataset_train, size=256, length=2000)
+sampler_train = RandomGeoSampler(dataset_train, size=256, length=5000)
 
 CORN = 1
 
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # PIN_MEMORY = True if DEVICE == "cuda" else False
 UINT16_MAX = 65535.0
+
+def identify_axis(shape):
+    # Three dimensional
+    if len(shape) == 5 : return [1,2,3]
+    # Two dimensional
+    elif len(shape) == 4 : return [1,2]
+    # Exception - Unknown
+    else : raise ValueError('Metric: Shape of tensor is neither 2D or 3D.')
 
 def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
     # Average of Dice coefficient for all batches, or for a single mask
@@ -99,17 +107,101 @@ def dice_loss(input: Tensor, target: Tensor, multiclass: bool = False):
     fn = multiclass_dice_coeff if multiclass else dice_coeff
     return 1 - fn(input, target, reduce_batch_first=True)
 
+# def tversky_loss(delta = 0.7, smooth = 0.000001):
+ #    """Tversky loss function for image segmentation using 3D fully convolutional deep networks
+	# Link: https://arxiv.org/abs/1706.05721
+ #    Parameters
+ #    ----------
+ #    delta : float, optional
+ #        controls weight given to false positive and false negatives, by default 0.7
+ #    smooth : float, optional
+ #        smoothing constant to prevent division by zero errors, by default 0.000001
+ #    """
+ #    def loss_function(y_true, y_pred):
+ #        # axis = identify_axis(y_true.shape)
+ #        # Calculate true positives (tp), false negatives (fn) and false positives (fp)   
+ #        tp = y_true * y_pred
+ #        fn = y_true * (1-y_pred)
+ #        fp = ((1-y_true) * y_pred)
+ #        tversky_class = (tp + smooth)/(tp + delta*fn + (1-delta)*fp + smooth)
+ #        # Average class scores
+ #        tversky_loss = torch.mean(1-tversky_class)
+	#
+ #        return tversky_loss
+	#
+ #    return loss_function
+
+def tversky_loss(true, logits, alpha, beta, eps=1e-7):
+    """Computes the Tversky loss [1].
+
+    Args:
+        true: a tensor of shape [B, H, W] or [B, 1, H, W].
+        logits: a tensor of shape [B, C, H, W]. Corresponds to
+            the raw output or logits of the model.
+        alpha: controls the penalty for false positives.
+        beta: controls the penalty for false negatives.
+        eps: added to the denominator for numerical stability.
+
+    Returns:
+        tversky_loss: the Tversky loss.
+
+    Notes:
+        alpha = beta = 0.5 => dice coeff
+        alpha = beta = 1 => tanimoto coeff
+        alpha + beta = 1 => F beta coeff
+
+    References:
+        [1]: https://arxiv.org/abs/1706.05721
+    """
+    num_classes = logits.shape[1]
+    if num_classes == 1:
+        true_1_hot = torch.eye(num_classes + 1)[true.long().squeeze(1)]
+        true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
+        true_1_hot_f = true_1_hot[:, 0:1, :, :]
+        true_1_hot_s = true_1_hot[:, 1:2, :, :]
+        true_1_hot = torch.cat([true_1_hot_s, true_1_hot_f], dim=1)
+        pos_prob = torch.sigmoid(logits)
+        neg_prob = 1 - pos_prob
+        probas = torch.cat([pos_prob, neg_prob], dim=1)
+    else:
+        true_1_hot = torch.eye(num_classes)[true.squeeze(1)]
+        true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
+        probas = F.softmax(logits, dim=1)
+    true_1_hot = true_1_hot.type(logits.type())
+    dims = (0,) + tuple(range(2, true.ndimension()))
+    intersection = torch.sum(probas * true_1_hot, dims)
+    fps = torch.sum(probas * (1 - true_1_hot), dims)
+    fns = torch.sum((1 - probas) * true_1_hot, dims)
+    num = intersection
+    denom = intersection + (alpha * fps) + (beta * fns)
+    tversky_loss = (num / (denom + eps)).mean()
+    return (1 - tversky_loss)
+
+
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    torch.cuda.set_device(rank)
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+
 def main(rank, world_size):
-    # ddp_setup(rank, world_size)
+    ddp_setup(rank, world_size)
     dataloader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, sampler=sampler_test, collate_fn=stack_samples, pin_memory=True, num_workers=0)
     dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler=sampler_train, collate_fn=stack_samples, pin_memory=True, num_workers=0)
     DEVICE = rank
     unet = UNET.UNet(len(BANDS), n_classes=1).to(DEVICE)
-    # unet = DDP(unet, device_ids=[DEVICE])
+    unet = DDP(unet, device_ids=[DEVICE])
 
+    # lossFunc = tversky_loss#BCEWithLogitsLoss()
     lossFunc = BCEWithLogitsLoss()
     scaler = torch.amp.grad_scaler.GradScaler()
-    opt = torch.optim.Adam(unet.parameters(), lr=0.0005)
+    opt = torch.optim.Adam(unet.parameters(), lr=0.0001, foreach=True)
     # opt = torch.optim.RMSprop(unet.parameters(),
     #                           lr=0.0003, weight_decay=1e-8, momentum=0.999, foreach=True)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'max', patience=5)  # goal: maximize Dice score
@@ -134,17 +226,21 @@ def main(rank, world_size):
             opt.zero_grad()
 
             pred = unet(image)
-            loss = lossFunc(pred, mask)
+            loss = dice_loss(F.sigmoid(pred.squeeze(1)), mask.squeeze(1).float(), multiclass=False)
+            loss += lossFunc(pred, mask)
+
+            loss.backward()
+            opt.step()
             # loss += dice_loss(F.sigmoid(pred.squeeze(1)), mask.squeeze(1).float(), multiclass=False)
 
             # Zero your gradients for every batch!
             # loss.backward()
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward()
 
             # Adjust learning weights
             # opt.step()
-            scaler.step(opt)
-            scaler.update()
+            # scaler.step(opt)
+            # scaler.update()
 
             totalTrainLoss += loss.item()
             totalTrainSteps += 1
@@ -167,14 +263,14 @@ def main(rank, world_size):
 
                     pred = unet(image)
                     # totalTestLoss += lossFunc(pred, mask)
-                    mask_pred = (pred > 0.5).float()
+                    mask_pred = (F.sigmoid(pred) > 0.5).float()
                     # compute the Dice score
                     totalTestLoss  += dice_coeff(mask_pred, mask, reduce_batch_first=False)
                     totalTestSteps += 1
 
                     dir_checkpoint = Path("./checkpoints")
                     Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-                    state_dict = unet.state_dict()
+                    state_dict = unet.module.state_dict()
                     state_dict['mask_values'] = mask.cpu().detach()
                     torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
                     logging.info(f'Checkpoint {epoch} saved!')
@@ -188,8 +284,10 @@ def main(rank, world_size):
             print("Train loss: {:.6f}, Dice score: {:.4f}".format(
                 avgTrainLoss, avgTestLoss))
 
-# if __name__ == "__main__":
-#     world_size = torch.cuda.device_count()
-#     mp.spawn(main, args=(world_size,), nprocs=world_size)
+if __name__ == "__main__":
+    world_size = torch.cuda.device_count()
+    print("world size:", world_size)
+    mp.spawn(main, args=(world_size,), nprocs=world_size)
+    distributed.destroy_process_group()
 
-main(0, 1)
+# main(0, 1)
