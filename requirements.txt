@@ -1,0 +1,6 @@
+torchgeo
+torch
+torchvision
+opencv-python
+numpy
+matplotlib
