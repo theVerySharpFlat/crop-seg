@@ -50,7 +50,7 @@ timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 cdl = CDL("data", download=True, checksum=True, years=[2023, 2022])
 
 # landsat7 = Landsat7("data/shelby_landsat_2", bands=Landsat7.all_bands[:5])
-landsat8_test = Landsat8("data/IA/L2/1023", bands=BANDS)
+landsat8_test = Landsat8("data/IA2/2023", bands=BANDS)
 landsat_test = landsat8_test
 dataset_test =  GeoDSWrapper(landsat_test & cdl)
 
@@ -80,7 +80,23 @@ def dice_loss(input: Tensor, target: Tensor, multiclass: bool = False):
     return 1 - fn(input, target, reduce_batch_first=True)
 
 
+transformer = pyproj.Transformer.from_crs(str(landsat8_test.crs), "EPSG:4326")
+
+def normalizeBandImage(tensor: Tensor, percentiles) -> Tensor:
+    c, d = percentiles
+
+    tensor = torch.mul(torch.sub(tensor, c), 1 / (d - c))
+
+    return tensor
+
+def normalizeBatch(batchImage: Tensor, bandPercentiles) -> Tensor:
+    for bandNum, percentiles in enumerate(bandPercentiles):
+        for batchNum in range(batchImage.shape[0]):
+            batchImage[batchNum][bandNum] = normalizeBandImage(batchImage[batchNum][bandNum], percentiles)
+
+    return batchImage
 def main(rank, world_size):
+    bandPercentiles = [([ 7767., 11340.]), ([ 8312., 12746.]), ([ 7861., 14691.]), ([ 8873., 28555.]), ([ 9059., 23145.]), ([ 8147., 20632.])]
     # ddp_setup(rank, world_size)
     dataloader_test = DataLoader(dataset_test, batch_size=1, sampler=dataset_test.sampler, collate_fn=stack_samples, pin_memory=True, num_workers=0)
     DEVICE = "cuda:0"
@@ -92,6 +108,10 @@ def main(rank, world_size):
         # unet.eval()
 
         for loc in dataset_test.sampler:
+            print("bbox:", loc)
+            print("landsat crs:", landsat8_test.crs)
+
+            print("lat long bbox:", transformer.transform_bounds(loc.minx, loc.miny, loc.maxx, loc.maxy))
             # data = landsat8_test[loc]
             # data["mask"] = cdl[loc]["mask"]
             data = dataset_test[loc]
@@ -103,6 +123,7 @@ def main(rank, world_size):
             fig.savefig("out.png")
 
             image = data["image"].to(DEVICE)
+            image = normalizeBatch(image, bandPercentiles)
             mask = torch.where(data["mask"] <= 60, data["mask"], 0.0)
             mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
             pred = unet(image.unsqueeze(0))

@@ -27,6 +27,7 @@ class GeoDSWrapper(Dataset):
 
 
     def __getitem__(self, idx: BoundingBox):
+        # print("get item!")
         # while True:
         data = self.ds[idx]
 

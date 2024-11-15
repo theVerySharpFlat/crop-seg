@@ -1,4 +1,5 @@
 import time
+import cv2
 # import datetime
 from datetime import datetime
 from torch.nn import BCEWithLogitsLoss
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 # from torch.utils.tensorboard import SummaryWriter
 # import torchgeo
 import logging
-from torchgeo.datasets import CDL, BoundingBox, stack_samples, Landsat7, Landsat8
+from torchgeo.datasets import CDL, BoundingBox, stack_samples, Landsat7, Landsat8, Landsat
 from torchgeo.samplers import RandomGeoSampler
 from matplotlib import pyplot as plt
 from pathlib import Path
@@ -19,7 +20,9 @@ from pathlib import Path
 import torch.amp
 from tqdm import tqdm
 
-from GeoDSWrapper import GeoDSWrapper
+# from GeoDSWrapper import GeoDSWrapper
+import mpBatcher
+from sampleChooser import AdaptiveGeoSampler, chooseSamples
 from unet import unet as UNET
 
 import numpy as np
@@ -44,7 +47,7 @@ import os
 #     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 BATCH_SIZE = 48
-NUM_EPOCHS = 100
+NUM_EPOCHS = 1000
 
 BANDS = [f"SR_B{i}" for i in range(2, 8)]
 
@@ -54,18 +57,13 @@ timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 # writer = SummaryWriter('runs/fashion_trainer_{}'.format(timestamp))
 # epoch_number = 0
 
-cdl = CDL("data", download=True, checksum=True, years=[2023, 2022])
-
-# landsat7 = Landsat7("data/shelby_landsat_2", bands=Landsat7.all_bands[:5])
-landsat8_test = Landsat8("data/IA/L2/1022", bands=BANDS)
-landsat_test = landsat8_test
-dataset_test =  GeoDSWrapper(landsat_test & cdl, nPerEpoch=1000)
-
-# sampler_test = RandomGeoSampler(dataset_test, size=256, length=1000)
-
-landsat8_train = Landsat8("data/IA/L2/1023", bands=BANDS)
-landsat_train = landsat8_train
-dataset_train =  GeoDSWrapper(landsat_train & cdl, nPerEpoch=5000)
+# def dsGen():
+#     cdl = CDL("data", download=True, checksum=True, years=[2023, 2022])
+#
+#     landsat8 = Landsat8("data/IA2/2023", bands=BANDS)
+#     landsat_train = landsat8
+#     dataset_train =  landsat_train & cdl
+#     return dataset_train
 
 # sampler_train = RandomGeoSampler(dataset_train, size=256, length=5000)
 
@@ -190,11 +188,75 @@ def ddp_setup(rank, world_size):
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
+def computePercentiles(ds, qa: Landsat, band: int):
+    sampler = AdaptiveGeoSampler(ds, qa, 100, 1)
+
+    points = []
+
+    for sample in sampler:
+        data = ds[sample]
+
+        lin: np.ndarray = data["image"][band].numpy().flatten()
+
+        points.extend(lin.tolist())
+
+    return (np.percentile(points, [1, 99]))
+
+def normalizeBandImage(tensor: Tensor, percentiles, clip) -> Tensor:
+    c, d = percentiles
+
+    tensor = torch.mul(torch.sub(tensor, c), 1 / (d - c))
+
+    if clip:
+        tensor = torch.clip(tensor, 1.0, 0.0)
+
+    return tensor
+
+def normalizeBatch(batchImage: Tensor, bandPercentiles, clip = False) -> Tensor:
+    for bandNum, percentiles in enumerate(bandPercentiles):
+        for batchNum in range(batchImage.shape[0]):
+            batchImage[batchNum][bandNum] = normalizeBandImage(batchImage[batchNum][bandNum], percentiles, clip)
+
+    return batchImage
+
+def denoiseMask(mask: Tensor):
+    assert len(mask.shape) <= 4 and len(mask.shape) >= 2
+
+    prevNDims = len(mask.shape)
+
+    while(len(mask.shape) < 4):
+        mask = mask.unsqueeze(0)
+    
+    kernel = np.ones((2,2),np.uint8)
+    for i in range(mask.shape[0]):
+        for j in range(mask.shape[1]):
+            mask[i][j] = torch.from_numpy(cv2.morphologyEx(mask[i][j].cpu().numpy(), cv2.MORPH_OPEN, kernel, iterations = 1))
+
+    while(len(mask.shape) > prevNDims):
+        mask = mask.squeeze(0)
+
+    return mask
 
 def main(rank, world_size):
+    cdl = CDL("data", download=True, checksum=True, years=[2023, 2022])
+
+    landsat8 = Landsat8("data/IA2/2023", bands=BANDS)
+    landsat8_test = Landsat8("data/IA2/2022", bands=BANDS)
+    qa_test = Landsat8("data/IA2/2022", bands=["QA_PIXEL"])
+    landsat_test = landsat8_test
+
+    dataset_test =  landsat_test & cdl
+
+    landsat_train = landsat8
+    qa_train = Landsat8("data/IA2/2023", bands=["QA_PIXEL"])
+    dataset_train =  landsat_train & cdl
+
+    # mgr = mpBatcher.MPDatasetManager(dsGen=dsGen, nBuckets=4, nWorkers=1)
+    sampler_test = AdaptiveGeoSampler(dataset_test, qa_test, 500, BATCH_SIZE)
+    sampler_train = AdaptiveGeoSampler(dataset_train, qa_train, 1000, BATCH_SIZE)
+    # sampler_train = mpBatcher.MPDatasetSampler(mgr, 1000, BATCH_SIZE)
+    # computePercentiles(dataset_train, qa_train, 2)
     ddp_setup(rank, world_size)
-    dataloader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, sampler=dataset_test.sampler, collate_fn=stack_samples, pin_memory=True, num_workers=0)
-    dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler=dataset_train.sampler, collate_fn=stack_samples, pin_memory=True, num_workers=0)
     DEVICE = rank
     unet = UNET.UNet(len(BANDS), n_classes=1).to(DEVICE)
     unet = DDP(unet, device_ids=[DEVICE])
@@ -202,12 +264,27 @@ def main(rank, world_size):
     # lossFunc = tversky_loss#BCEWithLogitsLoss()
     lossFunc = BCEWithLogitsLoss()
     scaler = torch.amp.grad_scaler.GradScaler()
-    opt = torch.optim.Adam(unet.parameters(), lr=0.001, foreach=True, weight_decay=1e-8)
+    opt = torch.optim.Adam(unet.parameters(), lr=0.005, foreach=True, weight_decay=1e-8)
     # opt = torch.optim.RMSprop(unet.parameters(),
     #                           lr=0.0003, weight_decay=1e-8, momentum=0.999, foreach=True)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'max', patience=5)  # goal: maximize Dice score
 
+    bandPercentiles = []
+    bandPercentiles = [([ 7767., 11340.]), ([ 8312., 12746.]), ([ 7861., 14691.]), ([ 8873., 28555.]), ([ 9059., 23145.]), ([ 8147., 20632.])]
+    if False:
+        if DEVICE == 0:
+            print("computing band percentiles...")
+            for i, _ in tqdm(enumerate(BANDS), total=len(BANDS)):
+                bandPercentiles.append(computePercentiles(dataset_train, qa_train, i))
+            print(bandPercentiles)
+        else:
+            for i, _ in (enumerate(BANDS)):
+                bandPercentiles.append(computePercentiles(dataset_train, qa_train, i))
+
     for epoch in tqdm(range(NUM_EPOCHS)):
+        dataloader_test = DataLoader(dataset_test, batch_size=1, sampler=sampler_test, collate_fn=stack_samples, pin_memory=True, num_workers=0)
+        dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler=sampler_train, collate_fn=stack_samples, pin_memory=True, num_workers=0)
+
         totalTrainLoss = 0
         totalTrainSteps = 0
         totalTestLoss = 0
@@ -220,9 +297,16 @@ def main(rank, world_size):
             nonlocal totalTrainSteps
 
             image = (batch["image"]).to(DEVICE)
+            image = normalizeBatch(image, bandPercentiles)
+            # print("image:", image)
+            # print("batch image shape:", batch["image"].shape)
             # print(image)
             mask = torch.where(batch["mask"] <= 60, batch["mask"], 0.0)
             mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
+            # print(mask[-2, -1])
+            # print(mask.shape)
+            mask = denoiseMask(mask).to(DEVICE)
+            # print(mask.shape)
 
             opt.zero_grad()
 
@@ -253,37 +337,98 @@ def main(rank, world_size):
             for batch in dataloader_train:
                 train_epoch()
 
-        if DEVICE == 0:
-            with torch.no_grad():
-                unet.eval()
 
+
+        #if DEVICE == 0:
+        with torch.no_grad():
+            unet.eval()
+
+            balances =[]
+            scores = []
+
+            def run_test():
+                nonlocal totalTestLoss
+                nonlocal totalTestSteps
+                nonlocal balances
+                nonlocal scores
+
+                image = (batch["image"]).to(DEVICE)
+                image = normalizeBatch(image, bandPercentiles)
+                mask = torch.where(batch["mask"] <= 60, batch["mask"], 0.0)
+                mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
+                # print(mask.shape)
+                # lol
+                mask = denoiseMask(mask).to(DEVICE).squeeze().unsqueeze(0).unsqueeze(0)
+                # print(mask.shape)
+
+                nonzeroes = torch.where(mask > 0.0, 1.0, 0.0).count_nonzero()
+                total = torch.numel(mask)
+
+                pred = unet(image)
+                # totalTestLoss += lossFunc(pred, mask)
+                mask_pred = (F.sigmoid(pred) > 0.5).float()
+                # compute the Dice score
+                score = dice_coeff(mask_pred, mask, reduce_batch_first=False)
+                totalTestLoss  += score
+                totalTestSteps += 1
+
+                balances.append(nonzeroes.item() / total)
+                scores.append(score.item())
+
+            if DEVICE==0:
                 for batch in tqdm(dataloader_test):
-                    image = (batch["image"]).to(DEVICE)
-                    mask = torch.where(batch["mask"] <= 60, batch["mask"], 0.0)
-                    mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
+                    run_test()
+            else:
+                for batch in dataloader_test:
+                    run_test()
+        # plt.close('all')
+        # plt.scatter(balances, scores)
+        # plt.show()
+        if DEVICE == 0:
+            dir_checkpoint = Path("./checkpoints")
+            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+            state_dict = unet.module.state_dict()
+            # state_dict['mask_values'] = mask.cpu().detach()
+            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            logging.info(f'Checkpoint {epoch} saved!')
 
-                    pred = unet(image)
-                    # totalTestLoss += lossFunc(pred, mask)
-                    mask_pred = (F.sigmoid(pred) > 0.5).float()
-                    # compute the Dice score
-                    totalTestLoss  += dice_coeff(mask_pred, mask, reduce_batch_first=False)
-                    totalTestSteps += 1
+        avgTrainLoss = totalTrainLoss / totalTrainSteps
+        avgTestLoss = totalTestLoss / totalTestSteps
+        # scheduler.step(avgTestLoss)
 
-                    dir_checkpoint = Path("./checkpoints")
-                    Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-                    state_dict = unet.module.state_dict()
-                    state_dict['mask_values'] = mask.cpu().detach()
-                    torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-                    logging.info(f'Checkpoint {epoch} saved!')
-
-            avgTrainLoss = totalTrainLoss / totalTrainSteps
-            avgTestLoss = totalTestLoss / totalTestSteps
-            scheduler.step(avgTestLoss)
-
-            # print the model training and validation information
+        # print the model training and validation information
+        if DEVICE == 0:
             print("[INFO] EPOCH: {}/{}".format(epoch + 1, NUM_EPOCHS))
             print("Train loss: {:.6f}, Dice score: {:.4f}".format(
                 avgTrainLoss, avgTestLoss))
+
+        def updateConcentrationsFromScoresAndDensities(scores, densities, nBuckets):
+            assert len(scores) == len(densities)
+
+            totalErrors = np.zeros(nBuckets)
+            totalErrorCounts = np.zeros(nBuckets)
+
+            for score, density in zip(scores, densities):
+                err = 1.0 - score
+
+                targetBucket = int(np.interp(density, [0.0, 1.0], [0, nBuckets - 1]))
+
+                totalErrors[targetBucket] += err
+                totalErrorCounts[targetBucket] += 1.0
+
+            with np.errstate(divide='ignore', invalid="ignore"):
+                # averageErrors = totalErrors / totalErrorCounts
+                # averageErrors[totalErrorCounts == 0] = 0.0
+                # totalAverageError = averageErrors.sum()
+
+                proportions = totalErrors / totalErrors.sum()
+
+                return list(proportions)
+
+        # sampler_train.concentrations = updateConcentrationsFromScoresAndDensities(scores, balances, 5)
+        # sampler_train.concentrations = [0.25, 0.25, 0.25, 0.25, 0.0]
+        if DEVICE == 0:
+            print("concentrations:",sampler_train.concentrations)
 
 if __name__ == "__main__":
     world_size = torch.cuda.device_count()
