@@ -1,3 +1,4 @@
+import sys
 import time
 import cv2
 # import datetime
@@ -237,23 +238,28 @@ def denoiseMask(mask: Tensor):
 
     return mask
 
+
 def main(rank, world_size):
     cdl = CDL("data", download=True, checksum=True, years=[2023, 2022])
 
-    landsat8 = Landsat8("data/IA2/2023", bands=BANDS)
-    landsat8_test = Landsat8("data/IA2/2022", bands=BANDS)
-    qa_test = Landsat8("data/IA2/2022", bands=["QA_PIXEL"])
+    landsat8 = Landsat8("data/IA2/2023", bands=BANDS) | Landsat8("data/IA2/2022", bands=BANDS)
+    landsat8_test = Landsat8("data/IA2/2023", bands=BANDS) | Landsat8("data/IA2/2022", bands=BANDS)
+    qa_test = Landsat8("data/IA2/2023", bands=["QA_PIXEL"]) | Landsat8("data/IA2/2022", bands=["QA_PIXEL"])
     landsat_test = landsat8_test
 
     dataset_test =  landsat_test & cdl
 
     landsat_train = landsat8
-    qa_train = Landsat8("data/IA2/2023", bands=["QA_PIXEL"])
+    qa_train = Landsat8("data/IA2/2023", bands=["QA_PIXEL"]) | Landsat8("data/IA2/2022", bands=["QA_PIXEL"])
+
     dataset_train =  landsat_train & cdl
 
     # mgr = mpBatcher.MPDatasetManager(dsGen=dsGen, nBuckets=4, nWorkers=1)
     sampler_test = AdaptiveGeoSampler(dataset_test, qa_test, 500, BATCH_SIZE)
     sampler_train = AdaptiveGeoSampler(dataset_train, qa_train, 1000, BATCH_SIZE)
+
+    test_samples = [sample for sample in sampler_test]
+
     # sampler_train = mpBatcher.MPDatasetSampler(mgr, 1000, BATCH_SIZE)
     # computePercentiles(dataset_train, qa_train, 2)
     ddp_setup(rank, world_size)
@@ -261,12 +267,15 @@ def main(rank, world_size):
     unet = UNET.UNet(len(BANDS), n_classes=1).to(DEVICE)
     unet = DDP(unet, device_ids=[DEVICE])
 
+    torch.distributed.barrier()
+    if len(sys.argv) >= 2:
+        unet.module.load_state_dict(torch.load(sys.argv[1], map_location={'cuda:0': f'cuda:{rank}'}))
+
     # lossFunc = tversky_loss#BCEWithLogitsLoss()
-    lossFunc = BCEWithLogitsLoss()
-    scaler = torch.amp.grad_scaler.GradScaler()
-    opt = torch.optim.Adam(unet.parameters(), lr=0.005, foreach=True, weight_decay=1e-8)
-    # opt = torch.optim.RMSprop(unet.parameters(),
-    #                           lr=0.0003, weight_decay=1e-8, momentum=0.999, foreach=True)
+    # lossFunc = BCEWithLogitsLoss()
+    # scaler = torch.amp.grad_scaler.GradScaler()
+    opt = torch.optim.AdamW(unet.parameters(), lr=0.00005, foreach=True, weight_decay=1e-2)
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'max', patience=5)  # goal: maximize Dice score
 
     bandPercentiles = []
@@ -282,7 +291,7 @@ def main(rank, world_size):
                 bandPercentiles.append(computePercentiles(dataset_train, qa_train, i))
 
     for epoch in tqdm(range(NUM_EPOCHS)):
-        dataloader_test = DataLoader(dataset_test, batch_size=1, sampler=sampler_test, collate_fn=stack_samples, pin_memory=True, num_workers=0)
+        dataloader_test = DataLoader(dataset_test, batch_size=1, sampler=test_samples, collate_fn=stack_samples, pin_memory=True, num_workers=0)
         dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler=sampler_train, collate_fn=stack_samples, pin_memory=True, num_workers=0)
 
         totalTrainLoss = 0
@@ -290,52 +299,37 @@ def main(rank, world_size):
         totalTestLoss = 0
         totalTestSteps = 0
 
-        unet.train()
+        if epoch != 0:
+            unet.train()
 
-        def train_epoch():
-            nonlocal totalTrainLoss
-            nonlocal totalTrainSteps
+            def train_epoch():
+                nonlocal totalTrainLoss
+                nonlocal totalTrainSteps
 
-            image = (batch["image"]).to(DEVICE)
-            image = normalizeBatch(image, bandPercentiles)
-            # print("image:", image)
-            # print("batch image shape:", batch["image"].shape)
-            # print(image)
-            mask = torch.where(batch["mask"] <= 60, batch["mask"], 0.0)
-            mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
-            # print(mask[-2, -1])
-            # print(mask.shape)
-            mask = denoiseMask(mask).to(DEVICE)
-            # print(mask.shape)
+                image = (batch["image"]).to(DEVICE)
+                image = normalizeBatch(image, bandPercentiles)
 
-            opt.zero_grad()
+                mask = torch.where(batch["mask"] <= 60, batch["mask"], 0.0)
+                mask = torch.where(mask >= 1, 1.0, 0.0).to(DEVICE)
+                mask = denoiseMask(mask).to(DEVICE)
 
-            pred = unet(image)
-            loss = dice_loss(F.sigmoid(pred.squeeze(1)), mask.squeeze(1).float(), multiclass=False)
-            # loss = lossFunc(pred, mask)
+                opt.zero_grad()
 
-            loss.backward()
-            opt.step()
-            # loss += dice_loss(F.sigmoid(pred.squeeze(1)), mask.squeeze(1).float(), multiclass=False)
+                pred = unet(image)
+                loss = dice_loss(F.sigmoid(pred.squeeze(1)), mask.squeeze(1).float(), multiclass=False)
 
-            # Zero your gradients for every batch!
-            # loss.backward()
-            # scaler.scale(loss).backward()
+                loss.backward()
+                opt.step()
 
-            # Adjust learning weights
-            # opt.step()
-            # scaler.step(opt)
-            # scaler.update()
+                totalTrainLoss += loss.item()
+                totalTrainSteps += 1
 
-            totalTrainLoss += loss.item()
-            totalTrainSteps += 1
-
-        if DEVICE == 0:
-            for batch in tqdm(dataloader_train):
-                train_epoch()
-        else:
-            for batch in dataloader_train:
-                train_epoch()
+            if DEVICE == 0:
+                for batch in tqdm(dataloader_train):
+                    train_epoch()
+            else:
+                for batch in dataloader_train:
+                    train_epoch()
 
 
 
@@ -392,7 +386,9 @@ def main(rank, world_size):
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
-        avgTrainLoss = totalTrainLoss / totalTrainSteps
+        avgTrainLoss = 0.0
+        if epoch != 0:
+            avgTrainLoss = totalTrainLoss / totalTrainSteps
         avgTestLoss = totalTestLoss / totalTestSteps
         # scheduler.step(avgTestLoss)
 
